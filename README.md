@@ -2,6 +2,11 @@
 
 A SMPTE/LTC-compatible timecode system that supports both standard count-up timecode and countdown mode. Uses native Biphase-M (Manchester) encoding for compatibility with standard SMPTE equipment.
 
+This package includes a python-based encoder that can be used to create audio files with SMPTE-compliant timecode, as well as a python-based decoder that can decode audio files, or use a live input. Additionally, when decoding from a live input, timecode can be distributed as an OSC string for easy feedback into other control systems.
+
+<a href="https://www.buymeacoffee.com/alokw" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
+
+
 ## Overview
 
 TTRRTT provides two modes of operation:
