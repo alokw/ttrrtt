@@ -2,9 +2,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.claude/
 
-zz_archive/
-zz_references/
+*zz*/
+*zz*
 
 # C extensions
 *.so

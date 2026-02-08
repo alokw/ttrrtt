@@ -7,7 +7,7 @@ A SMPTE/LTC-compatible timecode system that supports both standard count-up time
 TTRRTT provides two modes of operation:
 
 1. **Countdown Mode**: Timecode counts down to zero - useful for timers, countdowns, remaining time display
-2. **Count-Up Mode (Standard SMPTE)**: Traditional SMPTE timecode counting up from zero
+2. **Count-Up Mode (Standard SMPTE)**: Traditional SMPTE timecode counting up from a specific start time
 
 Both modes produce valid SMPTE/LTC audio that can be read by standard decoders. The direction is indicated by bit 60 of the frame.
 
@@ -117,7 +117,7 @@ The encoder supports the following frame rates:
 | 23.98 fps | `-r 23.98` | Film (24 * 1000/1001), HD video |
 | 24 fps | `-r 24` | Film production |
 | 25 fps | `-r 25` | PAL video |
-| 29.97 fps | `-r 29.97` | NTSC drop-frame timecode |
+| 29.97 fps | `-r 29.97` | NTSC timecode |
 | 30 fps | `-r 30` | Standard audio/video (default) |
 
 **Default**: 30 fps non-drop at 48 kHz sample rate
@@ -130,7 +130,6 @@ The encoder supports the following frame rates:
 - Use for NTSC video to match real-time clock
 
 **29.97 non-drop** (`-r 29.97`):
-- Also called "30ND" or "non-drop"
 - Encodes with bit 10 = 0 (no drop-frame flag)
 - Slight drift from real-time clock over time
 - This is the default when using `-r 29.97` without `--drop-frame`
@@ -141,7 +140,6 @@ The encoder supports the following frame rates:
 - Matches wall-clock time
 
 **30 fps drop-frame** (`-r 30 --drop-frame`):
-- MTC (MIDI Timecode) standard mode
 - Uses drop-frame encoding at nominal 30 fps
 
 **30 fps non-drop** (`-r 30`):
