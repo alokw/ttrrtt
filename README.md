@@ -1,10 +1,44 @@
 # FlexTC - SMPTE-Compatible, Flexible, Bi-Directional, Extended Timecode
 
-A SMPTE/LTC backwards-compatible timecode system that supports both standard count-up timecode and countdown mode. Uses native Biphase-M (Manchester) encoding for compatibility with standard SMPTE equipment.
-
-This package includes a Python-based encoder that can be used to create audio files with SMPTE-compliant timecode, as well as a Python-based decoder that can decode audio files or use a live input. When decoding from a live input, timecode can be distributed as an OSC string for easy feedback into other control systems.
+A SMPTE/LTC backwards-compatible timecode encoder/decoder that supports both standard count-up timecode and countdown mode. Uses native Biphase-M (Manchester) encoding for compatibility with standard SMPTE equipment. The decoder can also re-distribute input timecode as an OSC string, for easy reference in other software.
 
 <a href="https://www.buymeacoffee.com/alokw" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
+
+## Quick Start
+
+**Just want to use FlexTC without installing Python?**
+
+Download the latest pre-built application for your operating system from the [**Releases**](../../releases) page:
+
+- **Windows**: Download `FlexTC-Windows.zip`, extract, and run `FlexTC.exe`
+- **macOS**: Download `FlexTC-macOS.zip`, extract, and open `FlexTC.app`
+
+No Python installation required! The standalone applications include everything you need.
+
+
+## Screenshots
+
+<table>
+  <tr>
+    <td width="45%" rowspan="2" align="center">
+      <img src="assets/screenshots/flextc1-encoder.png" width="100%" alt="Encoder" /><br>
+      <em>Generate timecode files with count-up or countdown modes</em>
+    </td>
+    <td width="20%" align="center">
+      <img src="assets/screenshots/flextc2-decodefile.png" width="100%" alt="Decode File" /><br>
+      <em>Analyze timecode from WAV files</em>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="assets/screenshots/flextc3-decodeinput.png" width="100%" alt="Decode Input" /><br>
+      <em>Real-time decoding from audio input</em>
+    </td>
+  </tr>
+</table>
+
+
+
 
 ## Overview
 
@@ -28,22 +62,22 @@ Both modes produce valid SMPTE/LTC audio that can be read by standard decoders. 
 ## System Architecture
 
 ```
-┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
-│  SMPTE Encoder  │──WAV───▶│  Audio Player  │──XLR───▶│  SMPTE Decoder  │
-│                 │         │                │         │                 │
-│ Bidirectional   │         │ Playback device│         │ Auto-detects    │
-│ timecode gen    │         │ (any system)   │         │ direction       │
-│ 0-159 hours     │         │                │         │ Freewheeling    │
-└─────────────────┘         └─────────────────┘         └─────────────────┘
+┌─────────────────┐          ┌─────────────────┐         ┌─────────────────┐
+│  SMPTE Encoder  │──WAV───▶│  Audio Player   │──XLR───▶│  SMPTE Decoder  │
+│                 │          │                 │         │                 │
+│ Bidirectional   │          │ Playback device │         │ Auto-detects    │
+│ timecode gen    │          │ (any system)    │         │ direction       │
+│ 0-159 hours     │          │                 │         │ Freewheeling    │
+└─────────────────┘          └─────────────────┘         └─────────────────┘
                                                               │
                                                               ▼
-                                                        ┌─────────────┐
-                                                        │ OSC Output  │
-                                                        │ (optional)  │
-                                                        └─────────────┘
+                                                         ┌─────────────┐
+                                                         │ OSC Output  │
+                                                         │ (optional)  │
+                                                         └─────────────┘
 ```
 
-## Installation
+## Installation from Source
 
 ```bash
 # Install in editable/development mode (recommended)
@@ -57,6 +91,22 @@ pip install -e ".[gui]"
 #   flextc-decode  - Read timecode from audio
 #   flextc-gui     - Launch graphical interface
 ```
+
+### Graphical Interface (GUI)
+
+The easiest way to use FlexTC is through the GUI. If you downloaded a pre-built release, just run the application. If you installed from source:
+
+```bash
+flextc-gui
+```
+
+**GUI Features:**
+- **Encoder Tab**: Generate timecode files with visual controls
+- **Decode File Tab**: Analyze timecode from WAV files
+- **Decode Input Tab**: Real-time decoding from audio input with live timecode display
+
+All parameters from the CLI are available in the GUI, including frame rate, drop-frame mode, countdown mode, and OSC settings.
+
 
 ## Usage
 
@@ -151,21 +201,6 @@ Example output:
 ▼ 00:04:23;15  (packets: 3842)    # Countdown mode (drop-frame)
 ▲ 01:23:45:12  (packets: 5021)    # Count-up mode (non-drop)
 ```
-
-### Graphical Interface (GUI)
-
-FlexTC includes an optional native desktop GUI built with PySide6 (Qt for Python).
-
-```bash
-flextc-gui
-```
-
-**GUI Features:**
-- **Encoder Tab**: Generate timecode files with visual controls
-- **Decode File Tab**: Analyze timecode from WAV files
-- **Decode Input Tab**: Real-time decoding from audio input with live timecode display
-
-All parameters from the CLI are available in the GUI, including frame rate, drop-frame mode, countdown mode, and OSC settings.
 
 ## Frame Rates
 
@@ -336,7 +371,7 @@ FlexTC GUI can be packaged as standalone applications for macOS and Windows usin
 
 ```bash
 # Install PyInstaller
-pip install pyinstaller
+pip install pyinstaller pillow
 ```
 
 ### Building on macOS
