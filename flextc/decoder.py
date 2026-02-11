@@ -111,34 +111,50 @@ class Decoder:
 
     def __init__(
         self,
-        sample_rate: int = 44100,
+        sample_rate: Optional[int] = None,
         frame_rate: float = 30.0,
         callback: Optional[callable] = None,
         device: Optional[int] = None,
         channel: int = 0,
         debug: bool = False,
+        osc_enabled: bool = False,
+        osc_address: str = "127.0.0.1",
+        osc_port: int = 9988,
     ):
         """
         Initialize decoder.
 
         Args:
-            sample_rate: Audio sample rate (Hz)
+            sample_rate: Audio sample rate (Hz) - None to auto-detect from device
             frame_rate: Frame rate (fps) - None for auto-detect
             callback: Optional callback for each frame (timecode: Timecode)
             device: Audio input device (None = default)
             channel: Audio channel to listen to (0 = first/left, 1 = second/right)
             debug: Enable debug logging
+            osc_enabled: Enable OSC re-distribution
+            osc_address: OSC address (default: 127.0.0.1)
+            osc_port: OSC UDP port (default: 9988)
         """
+        # Auto-detect sample rate from device if not specified
+        if sample_rate is None:
+            sample_rate = self._get_device_sample_rate(device)
+
         self.sample_rate = sample_rate
         self.frame_rate = frame_rate
         self.callback = callback
         self.channel = channel
         self.debug = debug
 
+        # OSC re-distribution
+        self.osc_broadcaster: Optional[OSCBroadcaster] = None
+        if osc_enabled:
+            self.osc_broadcaster = OSCBroadcaster(address=osc_address, port=osc_port)
+            self.osc_broadcaster.enable()
+
         if self.debug:
             logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             _logger.setLevel(logging.DEBUG)
-            _logger.debug(f"Decoder initialized: sample_rate={sample_rate}, frame_rate={frame_rate}, channel={channel}")
+            _logger.debug(f"Decoder initialized: sample_rate={sample_rate}, frame_rate={frame_rate}, channel={channel}, osc={osc_enabled}")
 
         # Biphase decoder - created when frame rate is known
         self.biphase: Optional[BiphaseMDecoder] = None
@@ -164,12 +180,37 @@ class Decoder:
         self._last_valid_hour: Optional[int] = None  # For hour continuity checking
         self._hour_confidence: int = 0  # Number of consecutive frames with same hour range
 
+        # Freewheeling: continue incrementing from last known timecode when glitches occur
+        self._freewheel_base_timecode: Optional[Timecode] = None  # Last known good timecode
+        self._freewheel_base_time: Optional[float] = None  # When that timecode was received
+        self._freewheel_timeout = 0.25  # seconds - how long to freewheel before accepting jump
+        self._is_freewheeling = False  # Currently in freewheel mode?
+
         # Audio stream
         self.stream: Optional[sd.InputStream] = None
         self.device = device
 
         # Last update time
         self.last_update_time: Optional[float] = None
+
+    def _get_device_sample_rate(self, device: Optional[int]) -> int:
+        """
+        Get the default sample rate for an audio device.
+
+        Args:
+            device: Device index (None for default device)
+
+        Returns:
+            Default sample rate for the device
+        """
+        try:
+            device_info = sd.query_devices(device)
+            sr = device_info['default_samplerate']
+            _logger.info(f"Auto-detected sample rate: {sr} Hz from device: {device_info['name']}")
+            return int(sr)
+        except Exception as e:
+            _logger.warning(f"Could not auto-detect sample rate, using default 48000 Hz: {e}")
+            return 48000
 
     def _is_hour_plausible(self, hours: int) -> bool:
         """
@@ -220,6 +261,152 @@ class Decoder:
 
         return True
 
+    def _is_timecode_jump_reasonable(self, tc: 'Timecode', current_time: float) -> tuple[bool, Optional[Timecode]]:
+        """
+        Check if a timecode jump is reasonable or if we should freewheel.
+
+        Freewheeling strategy:
+        - When a bad jump is detected, return (False, freewheeled_timecode)
+        - The freewheeled timecode continues incrementing from the last known good value
+        - If incoming timecode matches expected freewheled value, exit freewheel mode
+        - If freewheel timeout expires, accept the jump and reset
+
+        Args:
+            tc: The new timecode to check
+            current_time: Current timestamp
+
+        Returns:
+            Tuple of (should_accept: bool, timecode_to_use: Optional[Timecode])
+            - If should_accept is True, use tc
+            - If should_accept is False, use the returned freewheeled timecode
+        """
+        # Get frame rate
+        fps = self.frame_rate if self.frame_rate else (tc.fps if tc.fps else 30.0)
+
+        # No previous reference - accept anything, don't freewheel
+        if self._freewheel_base_timecode is None:
+            self._is_freewheeling = False
+            return True, None
+
+        # If we're not currently freewheeling, check if this jump is suspicious
+        if not self._is_freewheeling:
+            # Calculate the frame difference
+            def tc_to_frames(t):
+                return (t.hours * 3600 + t.minutes * 60 + t.seconds) * fps + t.frames
+
+            base_frames = tc_to_frames(self._freewheel_base_timecode)
+            new_frames = tc_to_frames(tc)
+
+            frame_diff = new_frames - base_frames
+            time_diff = current_time - self._freewheel_base_time
+
+            # Expected frames based on time elapsed and direction
+            expected_direction = -1 if not self._freewheel_base_timecode.count_up else 1
+            expected_frames = time_diff * fps * expected_direction
+
+            # Calculate how far off the incoming timecode is from expected
+            deviation = abs(frame_diff - expected_frames)
+
+            # Only reject jumps that are significantly off from expected
+            # Allow up to 2 frames of deviation for normal timing variations
+            max_deviation = 2
+
+            # Also reject if direction changed without a legitimate reason
+            direction_changed = (tc.count_up != self._freewheel_base_timecode.count_up)
+
+            if deviation > max_deviation or direction_changed:
+                # Jump is suspicious - enter freewheel mode
+                self._is_freewheeling = True
+                if self.debug:
+                    _logger.debug(f"Freewheel: Suspicious jump detected (deviation: {deviation:.1f} frames, direction_change: {direction_changed})")
+
+                # Fall through to generate freewheeled timecode below
+
+        # If we're freewheeling (either just started or already in progress)
+        if self._is_freewheeling:
+            # Check if incoming timecode matches expected freewheled value
+            time_since_base = current_time - self._freewheel_base_time
+            expected_direction = -1 if not self._freewheel_base_timecode.count_up else 1
+            expected_frame_offset = time_since_base * fps * expected_direction
+
+            # Check if this incoming frame "catches up" to where we expect it to be
+            def tc_to_frames(t):
+                return (t.hours * 3600 + t.minutes * 60 + t.seconds) * fps + t.frames
+
+            base_frames = tc_to_frames(self._freewheel_base_timecode)
+            new_frames = tc_to_frames(tc)
+            actual_frame_offset = new_frames - base_frames
+
+            # If incoming matches expected within 2 frames, it caught up - resume normal
+            if abs(actual_frame_offset - expected_frame_offset) <= 2:
+                # Incoming timecode caught up to our freewheeled value
+                self._is_freewheeling = False
+                if self.debug:
+                    _logger.debug(f"Freewheel: Incoming timecode caught up, resuming normal decoding")
+                return True, None
+
+            # Check if freewheel timeout expired - accept the jump
+            if time_since_base > self._freewheel_timeout:
+                self._is_freewheeling = False
+                if self.debug:
+                    _logger.debug(f"Freewheel: Timeout expired, accepting jump to new timecode")
+                return True, None
+
+            # Generate freewheeled timecode: increment from base at expected rate
+            freewheeled = self._increment_timecode(self._freewheel_base_timecode, time_since_base, fps)
+            return False, freewheeled
+
+        # Not freewheeling and jump was acceptable
+        return True, None
+
+    def _increment_timecode(self, base_tc: Timecode, elapsed_seconds: float, fps: float) -> Timecode:
+        """
+        Increment a timecode by a time duration at a given frame rate.
+
+        Args:
+            base_tc: Base timecode to increment from
+            elapsed_seconds: Time elapsed in seconds
+            fps: Frame rate for calculation
+
+        Returns:
+            A new Timecode object incremented by the elapsed time
+        """
+        # Calculate total frame offset
+        direction = -1 if not base_tc.count_up else 1
+        total_frames = int(round(elapsed_seconds * fps * direction))
+
+        # Convert base to total frames
+        base_total = (base_tc.hours * 3600 + base_tc.minutes * 60 + base_tc.seconds) * fps + base_tc.frames
+        new_total = base_total + total_frames
+
+        # Handle negative (countdown past zero)
+        if new_total < 0:
+            new_total = abs(new_total)
+            # For countdown that went past zero, flip direction
+            count_up = True
+        else:
+            count_up = base_tc.count_up
+
+        # Convert back to HH:MM:SS:FF
+        new_frames = int(new_total % fps)
+        remaining = new_total // fps
+        new_seconds = int(remaining % 60)
+        remaining = remaining // 60
+        new_minutes = int(remaining % 60)
+        new_hours = int(remaining // 60)
+
+        # Create new timecode with same frame_rate and drop_frame setting as base
+        return Timecode(
+            hours=new_hours,
+            minutes=new_minutes,
+            seconds=new_seconds,
+            frames=new_frames,
+            frame_rate=base_tc.frame_rate,
+            drop_frame=base_tc.drop_frame,
+            count_up=count_up,
+            user_bits=base_tc.user_bits
+        )
+
     def _process_frames(self, frames: List[List[int]]) -> tuple[bool, int, int]:
         """
         Process decoded frames and extract timecode.
@@ -253,8 +440,24 @@ class Decoder:
                     continue
 
                 valid_timecode_count += 1
+
+                # Freewheeling: check if this jump is reasonable
+                # Returns (should_accept, freewheeled_timecode_or_None)
+                current_time = time.time()
+                should_accept, freewheeled_tc = self._is_timecode_jump_reasonable(timecode, current_time)
+
+                # Determine which timecode to use
+                if should_accept:
+                    tc_to_use = timecode
+                    # Update freewheel base to this new accepted timecode
+                    self._freewheel_base_timecode = timecode
+                    self._freewheel_base_time = current_time
+                else:
+                    tc_to_use = freewheeled_tc
+                    # Don't update freewheel base - keep it for next iteration
+
                 # Check if timecode is stuck (repeating same value)
-                tc_value = (timecode.hours, timecode.minutes, timecode.seconds, timecode.frames)
+                tc_value = (tc_to_use.hours, tc_to_use.minutes, tc_to_use.seconds, tc_to_use.frames)
                 if self._last_timecode_value == tc_value:
                     self._stuck_frame_count += 1
                 else:
@@ -262,11 +465,13 @@ class Decoder:
                     self._last_timecode_value = tc_value
                     timecode_progressed = True
 
+                # Update current timecode (the raw incoming value)
                 self.current_timecode = timecode
                 self.packets_received += 1
-                self.last_update_time = time.time()
+                self.last_update_time = current_time
 
-                # Update hour confidence tracking
+                # Update hour confidence tracking based on raw incoming timecode
+                # (we want to track the actual signal, not our freewheeled values)
                 if self._last_valid_hour is not None:
                     if self._last_valid_hour // 10 == timecode.hours // 10:
                         # Same tens range, increase confidence
@@ -278,8 +483,13 @@ class Decoder:
                     self._hour_confidence = 1
                 self._last_valid_hour = timecode.hours
 
+                # Send via OSC if enabled - send the timecode we're displaying
+                # (which might be freewheeled)
+                if self.osc_broadcaster and self._hour_confidence >= 3:
+                    self.osc_broadcaster.send_timecode(tc_to_use)
+
                 if self.callback:
-                    self.callback(timecode)
+                    self.callback(tc_to_use)
 
         return timecode_progressed, valid_timecode_count, frames_rejected_for_hour
 
@@ -335,6 +545,10 @@ class Decoder:
             self._hour_confidence = 0
             self._detection_buffer.clear()
             self._detection_buffer_samples = 0
+            # Reset freewheeling state
+            self._freewheel_base_timecode = None
+            self._freewheel_base_time = None
+            self._is_freewheeling = False
             # Don't log warning every time - too noisy
             if self.debug:
                 _logger.warning("[SIGNAL LOSS] Entering detection mode")
@@ -429,6 +643,10 @@ class Decoder:
                                 self._last_valid_sample_time = current_time
                                 self._stuck_frame_count = 0
                                 self._last_timecode_value = None
+                                # Initialize freewheeling state with first valid timecode
+                                self._freewheel_base_timecode = self.current_timecode
+                                self._freewheel_base_time = current_time
+                                self._is_freewheeling = False
                                 _logger.info(f"[DETECTION] Successfully locked on signal! (offset: {offset})")
                                 # Clear buffer after success
                                 self._detection_buffer.clear()
@@ -467,15 +685,19 @@ class Decoder:
                     # Try to process frames - may get valid timecodes
                     self._process_frames(decoded_frames)
                     # If we got any valid timecode, exit detection mode
-                    if self.current_timecode is not None:
-                        self._in_detection_mode = False
-                        self._last_valid_sample_time = current_time
-                        self._stuck_frame_count = 0
-                        self._last_timecode_value = None
-                        _logger.info("[DETECTION] Successfully locked on signal!")
-                        # Clear buffer after success
-                        self._detection_buffer.clear()
-                        self._detection_buffer_samples = 0
+                if self.current_timecode is not None:
+                    self._in_detection_mode = False
+                    self._last_valid_sample_time = current_time
+                    self._stuck_frame_count = 0
+                    self._last_timecode_value = None
+                    # Initialize freewheeling state with first valid timecode
+                    self._freewheel_base_timecode = self.current_timecode
+                    self._freewheel_base_time = current_time
+                    self._is_freewheeling = False
+                    _logger.info("[DETECTION] Successfully locked on signal!")
+                    # Clear buffer after success
+                    self._detection_buffer.clear()
+                    self._detection_buffer_samples = 0
                 else:
                     # No valid timecodes yet - keep accumulating, don't clear buffer
                     # Stay in detection mode but keep the decoder
@@ -499,8 +721,8 @@ class Decoder:
         if decoded_frames:
             timecode_progressed, valid_count, rejected_for_hour = self._process_frames(decoded_frames)
 
-            # If we're getting frames but rejecting some for hour issues, still consider
-            # the signal valid - update _last_valid_sample_time to avoid signal loss
+            # If we're getting frames (even if some are rejected), consider
+            # the signal valid - update _last_valid_sample_time to avoid false signal loss
             if valid_count > 0 or rejected_for_hour > 0:
                 self._last_valid_sample_time = current_time
 
@@ -587,9 +809,16 @@ class Decoder:
             self.stream.close()
             self.stream = None
 
-    def get_timecode(self) -> Optional[Timecode]:
+        # Stop OSC re-distribution
+        if self.osc_broadcaster:
+            self.osc_broadcaster.disable()
+
+    def get_timecode(self, send_osc: bool = False) -> Optional[Timecode]:
         """
         Get the current timecode.
+
+        Args:
+            send_osc: If True, also send OSC broadcast with this timecode
 
         Returns:
             Timecode object, or None if no valid data received recently
@@ -603,7 +832,21 @@ class Decoder:
         if current_time - self.last_update_time > 1.0:
             return None
 
-        return self.current_timecode
+        # If we have a freewheel base, calculate and return the freewheeled timecode
+        tc = None
+        if self._freewheel_base_timecode is not None:
+            fps = self.frame_rate if self.frame_rate else (self._freewheel_base_timecode.fps if self._freewheel_base_timecode.fps else 30.0)
+            elapsed = current_time - self._freewheel_base_time
+            tc = self._increment_timecode(self._freewheel_base_timecode, elapsed, fps)
+        else:
+            # Fall back to current_timecode if no freewheel base
+            tc = self.current_timecode
+
+        # Send OSC if requested and we have sufficient confidence
+        if send_osc and tc and self.osc_broadcaster and self._hour_confidence >= 3:
+            self.osc_broadcaster.send_timecode(tc)
+
+        return tc
 
     def get_statistics(self) -> dict:
         """
@@ -636,10 +879,10 @@ def detect_frame_rate(
     Auto-detect frame rate from audio samples by trying all rates.
 
     The detection works by:
-    1. Trying each candidate frame rate with the biphase decoder
-    2. Counting how many valid timecodes are produced
-    3. Checking which frame rate's biphase timing produces the most consistent results
-    4. Also tries inverted polarity for compatibility with different encoders
+    1. Finding edges (zero-crossings) in the audio signal
+    2. Measuring the actual period between edges
+    3. Comparing to expected periods for each frame rate
+    4. Also checking bits 10-11 for drop-frame and color frame flags
 
     Args:
         samples: Audio samples
@@ -648,20 +891,71 @@ def detect_frame_rate(
     Returns:
         Detected frame rate, or 30.0 as default
     """
-    # Frame rates to try with their identifying characteristics
-    # (fps_value, bit10_drop, bit11_color)
+    # First, analyze edge timing to narrow down candidates
+    # Find edges (zero-crossings)
+    edges = []
+    for i in range(1, len(samples)):
+        if (samples[i-1] >= 0 and samples[i] < 0) or (samples[i-1] < 0 and samples[i] >= 0):
+            edges.append(i)
+
+    if len(edges) < 20:
+        return 30.0  # Not enough data
+
+    # Calculate periods between consecutive edges
+    periods = []
+    for i in range(1, min(len(edges), 100)):
+        periods.append(edges[i] - edges[i-1])
+
+    if not periods:
+        return 30.0
+
+    # Expected samples per half-bit period for each frame rate
+    # At 30fps: 48000 / (80 * 30) / 2 = 10 samples per half-bit
+    # At 24fps: 48000 / (80 * 24) / 2 = 12.5 samples per half-bit
+    # At 25fps: 48000 / (80 * 25) / 2 = 12 samples per half-bit
+    # At 29.97fps: 48000 / (80 * 29.97) / 2 ≈ 10.01 samples per half-bit
+    # At 23.98fps: 48000 / (80 * 23.98) / 2 ≈ 12.51 samples per half-bit
+
+    expected_half_bits = {
+        30.0: sample_rate / (80 * 30) / 2,
+        29.97: sample_rate / (80 * 29.97) / 2,
+        25.0: sample_rate / (80 * 25) / 2,
+        24.0: sample_rate / (80 * 24) / 2,
+        23.98: sample_rate / (80 * 23.98) / 2,
+    }
+
+    # Score each frame rate by counting how many measured periods fall within tolerance
+    # This is more robust than just taking the most common period
+    timing_scores = {}
+    for fps, expected_period in expected_half_bits.items():
+        # Count periods within ±1.5 samples of expected (tolerant to timing variations)
+        tolerance = 1.5
+        matching_count = sum(1 for p in periods if abs(p - expected_period) <= tolerance)
+        # Also give partial credit for periods within ±3 samples
+        partial_count = sum(1 for p in periods if 1.5 < abs(p - expected_period) <= 3)
+        timing_scores[fps] = matching_count * 2 + partial_count
+
+    # Sort by score (higher is better)
+    timing_candidates = sorted(timing_scores.items(), key=lambda x: x[1], reverse=True)
+
+    # Now verify the top candidates by actually decoding and checking bits 10-11
+    # Only check the top 2 timing candidates to avoid unnecessary work
     frame_rate_configs = [
         (30.0, False, False),
         (25.0, False, True),
-        (29.97, True, False),   # 29.97 drop-frame
+        (29.97, True, False),
         (24.0, False, False),
         (23.98, False, False),
-        (29.97, False, False),  # 29.97 non-drop
-        (30.0, True, False),    # 30 drop-frame
+        (29.97, False, False),
+        (30.0, True, False),
     ]
 
     best_rate = 30.0
     best_score = -1
+
+    # Prioritize frame rates that match the measured timing
+    # Give top 2 timing candidates priority
+    priority_fps = [fps for fps, _ in timing_candidates[:2]]
 
     # Try both normal and inverted polarity
     for inverted in (False, True):
@@ -696,9 +990,12 @@ def detect_frame_rate(
                     valid_timecodes += 1
 
             # Score: prioritize matching bits, then valid timecode count
-            # Inverted gets slightly lower score to prefer normal polarity when equal
+            # Add timing bonus if this rate matches our measured timing
+            timing_bonus = 50 if test_rate in priority_fps else 0
             polarity_penalty = 0 if not inverted else 10
-            score = matching_bits * 100 + valid_timecodes - polarity_penalty
+            # Prefer 30fps as tiebreaker for ambiguous cases (most common, and 24/30 encode identically)
+            fps_preference = 5 if test_rate == 30.0 else 0
+            score = matching_bits * 100 + valid_timecodes + timing_bonus + fps_preference - polarity_penalty
 
             if score > best_score:
                 best_score = score
@@ -709,8 +1006,8 @@ def detect_frame_rate(
 
 def decode_file(
     file_path: str,
-    sample_rate: int = 44100,
-    frame_rate: float = None,
+    sample_rate: Optional[int] = None,
+    frame_rate: Optional[float] = None,
 ) -> tuple:
     """
     Decode SMPTE/LTC from an audio file.
@@ -720,7 +1017,7 @@ def decode_file(
 
     Args:
         file_path: Path to audio file
-        sample_rate: Expected sample rate
+        sample_rate: Expected sample rate (None to use file's native rate)
         frame_rate: Frame rate (None for auto-detect)
 
     Returns:
@@ -735,8 +1032,8 @@ def decode_file(
     if len(all_samples.shape) > 1:
         all_samples = all_samples[:, 0]
 
-    if sr != sample_rate:
-        # Resample if needed
+    # If sample_rate is specified and differs from file rate, resample
+    if sample_rate is not None and sr != sample_rate:
         from scipy import signal
         all_samples = signal.resample(all_samples, int(len(all_samples) * sample_rate / sr))
         sr = sample_rate
@@ -795,6 +1092,7 @@ Examples:
   %(prog)s --list-devices               # Show audio devices
 
 The decoder automatically detects:
+- Sample rate (from device default)
 - Frame rate (from timing analysis, or use -r to specify)
 - Count-up mode (standard SMPTE, shows ▲)
 - Countdown mode (countdown, shows ▼)
@@ -823,8 +1121,8 @@ Direction is indicated by bit 60:
     parser.add_argument(
         "-s", "--sample-rate",
         type=int,
-        default=48000,
-        help="Sample rate in Hz (default: 48000)",
+        default=None,
+        help="Sample rate in Hz (default: auto-detect from device)",
     )
     parser.add_argument(
         "-r", "--frame-rate",

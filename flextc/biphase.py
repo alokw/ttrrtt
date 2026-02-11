@@ -167,11 +167,17 @@ class BiphaseMDecoder:
 
         self.buffer = np.zeros(0)
         self.bit_buffer: List[int] = []
+        # Remember the offset where we found the last valid sync
+        # This helps maintain alignment even if some bits get corrupted
+        self._sync_offset: Optional[int] = None
+        self._frames_at_offset: int = 0  # Count of consecutive frames at current offset
 
     def reset(self):
         """Reset decoder state."""
         self.buffer = np.zeros(0)
         self.bit_buffer = []
+        self._sync_offset = None
+        self._frames_at_offset = 0
 
     def _find_edges(self, samples: np.ndarray) -> List[int]:
         """Find edge positions (zero-crossings)."""
@@ -279,8 +285,17 @@ class BiphaseMDecoder:
         while len(self.bit_buffer) >= 80 and attempts < max_attempts:
             attempts += 1
             frame_found = False
+            found_offset = None
 
-            for offset in range(min(20, len(self.bit_buffer) - 79)):
+            # If we have a known sync offset, try it first
+            # This helps maintain alignment even if some bits get corrupted
+            search_order = list(range(min(20, len(self.bit_buffer) - 79)))
+            if self._sync_offset is not None and self._sync_offset < len(search_order):
+                # Move known offset to the front of search order
+                search_order.remove(self._sync_offset)
+                search_order.insert(0, self._sync_offset)
+
+            for offset in search_order:
                 frame_bits = self.bit_buffer[offset:offset + 80]
 
                 # Check sync (bits 64-79)
@@ -293,20 +308,35 @@ class BiphaseMDecoder:
                 errors_normal = sum(1 for a, b in zip(sync, sync_expected) if a != b)
                 errors_inv = sum(1 for a, b in zip(sync, sync_expected_inv) if a != b)
 
-                if errors_normal <= 2:
+                if errors_normal <= 1:
                     frames.append(frame_bits)
+                    found_offset = offset
                     self.bit_buffer = self.bit_buffer[offset + 80:]
                     frame_found = True
                     break
-                elif errors_inv <= 2:
+                elif errors_inv <= 1:
                     # Inverse polarity - invert all bits and add
                     frame_bits = [1 - b for b in frame_bits]
                     frames.append(frame_bits)
+                    found_offset = offset
                     self.bit_buffer = self.bit_buffer[offset + 80:]
                     frame_found = True
                     break
 
             if frame_found:
+                # Update sync offset tracking
+                if found_offset == self._sync_offset:
+                    self._frames_at_offset += 1
+                elif self._frames_at_offset >= 3:
+                    # Only change offset if we've seen 3+ frames at the old offset
+                    # This prevents spurious offset changes
+                    self._sync_offset = found_offset
+                    self._frames_at_offset = 1
+                elif self._sync_offset is None:
+                    # First frame found, establish the offset
+                    self._sync_offset = found_offset
+                    self._frames_at_offset = 1
+
                 # Successfully found and extracted a frame, continue looking for more
                 continue
             else:
@@ -314,10 +344,17 @@ class BiphaseMDecoder:
                 # Drop more bits when we're stuck to clear corrupted data faster
                 drop_amount = min(8, len(self.bit_buffer))
                 self.bit_buffer = self.bit_buffer[drop_amount:]
+                # Reset offset tracking if we're failing to find frames
+                if self._frames_at_offset > 0:
+                    self._frames_at_offset -= 1
+                    if self._frames_at_offset <= 0:
+                        self._sync_offset = None
 
         # If bit_buffer is getting too large, clear it entirely (corrupted state)
         if len(self.bit_buffer) > 500:
             self.bit_buffer = []
+            self._sync_offset = None
+            self._frames_at_offset = 0
 
         return frames
 

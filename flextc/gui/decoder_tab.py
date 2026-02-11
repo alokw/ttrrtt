@@ -33,7 +33,7 @@ class DecoderWorker(QThread):
     finished = Signal(dict)  # Result dict on success
     error = Signal(str)     # Error message on failure
 
-    def __init__(self, file_path: str, sample_rate: int, frame_rate: Optional[float]):
+    def __init__(self, file_path: str, sample_rate: Optional[int], frame_rate: Optional[float]):
         super().__init__()
         self.file_path = file_path
         self.sample_rate = sample_rate
@@ -43,6 +43,15 @@ class DecoderWorker(QThread):
         """Run the decoding operation in the background thread."""
         try:
             self.progress.emit("Reading file...")
+
+            # Read the file first to get its actual sample rate
+            import soundfile as sf
+            samples, file_sr = sf.read(self.file_path)
+            actual_sr = file_sr
+
+            # If user specified a different rate, we'll report what was used
+            if self.sample_rate is not None:
+                actual_sr = self.sample_rate
 
             # Use existing decode_file function
             first_tc, last_tc, detected_rate, duration = decode_file(
@@ -92,6 +101,7 @@ class DecoderWorker(QThread):
                 'first_tc': first_tc,
                 'last_tc': last_tc,
                 'frame_rate': detected_rate,
+                'sample_rate': actual_sr,
                 'duration_seconds': duration,
                 'counting_up': counting_up,
                 'tc_duration': tc_duration,
@@ -149,7 +159,8 @@ class DecoderTab(QWidget):
         # Sample rate
         self.sample_rate_combo = QComboBox()
         self.sample_rate_combo.addItems([
-            "48000 Hz (Default)",
+            "Auto-detect (Recommended)",
+            "48000 Hz",
             "44100 Hz",
         ])
         self.sample_rate_combo.setCurrentIndex(0)
@@ -243,6 +254,7 @@ class DecoderTab(QWidget):
         labels = [
             "File Name",
             "File Size",
+            "Sample Rate",
             "Frame Rate",
             "Start Timecode",
             "End Timecode",
@@ -269,9 +281,11 @@ class DecoderTab(QWidget):
             # Clear previous results
             self._init_results_table()
 
-    def _get_sample_rate(self) -> int:
-        """Get sample rate from combo box."""
+    def _get_sample_rate(self) -> Optional[int]:
+        """Get sample rate from combo box. Returns None for auto-detect."""
         text = self.sample_rate_combo.currentText()
+        if "Auto" in text:
+            return None
         if "44100" in text:
             return 44100
         return 48000
@@ -348,30 +362,34 @@ class DecoderTab(QWidget):
             size_str = f"{size_bytes} bytes"
         self._show_result_row(1, "File Size", size_str)
 
+        # Sample rate
+        sr_str = f"{result['sample_rate']} Hz"
+        self._show_result_row(2, "Sample Rate", sr_str)
+
         # Frame rate
-        self._show_result_row(2, "Frame Rate", f"{result['frame_rate']} fps")
+        self._show_result_row(3, "Frame Rate", f"{result['frame_rate']} fps")
 
         # Start timecode
-        self._show_result_row(3, "Start Timecode", format_timecode(first_tc))
+        self._show_result_row(4, "Start Timecode", format_timecode(first_tc))
 
         # End timecode
         if last_tc:
             separator = ";" if first_tc.is_drop_frame else ":"
             direction_symbol = "▲" if result['counting_up'] else "▼"
             end_tc_str = f"{direction_symbol} {last_tc.hours:02d}:{last_tc.minutes:02d}:{last_tc.seconds:02d}{separator}{last_tc.frames:02d}"
-            self._show_result_row(4, "End Timecode", end_tc_str)
+            self._show_result_row(5, "End Timecode", end_tc_str)
         else:
-            self._show_result_row(4, "End Timecode", "(not found)")
+            self._show_result_row(5, "End Timecode", "(not found)")
 
         # Duration
-        self._show_result_row(5, "Duration", result['tc_duration'])
+        self._show_result_row(6, "Duration", result['tc_duration'])
 
         # Direction
         direction = "Counting up" if result['counting_up'] else "Counting down"
-        self._show_result_row(6, "Direction", direction)
+        self._show_result_row(7, "Direction", direction)
 
         # Drop-frame
-        self._show_result_row(7, "Drop-Frame", "Yes" if first_tc.is_drop_frame else "No")
+        self._show_result_row(8, "Drop-Frame", "Yes" if first_tc.is_drop_frame else "No")
 
         # Show success in parent window status bar
         parent_window = self.window()

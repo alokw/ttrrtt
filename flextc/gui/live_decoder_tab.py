@@ -9,7 +9,7 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
-    QComboBox, QSpinBox, QPushButton, QLabel, QFrame
+    QComboBox, QSpinBox, QPushButton, QLabel, QFrame, QCheckBox, QLineEdit
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
@@ -77,14 +77,38 @@ class LiveDecoderTab(QWidget):
         # Sample rate
         self.sample_rate_combo = QComboBox()
         self.sample_rate_combo.addItems([
-            "48000 Hz (Default)",
+            "Auto-detect (Default)",
             "44100 Hz",
+            "48000 Hz",
         ])
         self.sample_rate_combo.setCurrentIndex(0)
         settings_layout.addRow("Sample Rate:", self.sample_rate_combo)
 
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
+
+        # === OSC Re-Distribution Section ===
+        osc_group = QGroupBox("OSC Re-Distribution")
+        osc_layout = QFormLayout()
+
+        # OSC enable checkbox
+        self.osc_enabled_checkbox = QCheckBox("Enable OSC re-distribution")
+        self.osc_enabled_checkbox.setChecked(False)
+        osc_layout.addRow("", self.osc_enabled_checkbox)
+
+        # OSC address
+        self.osc_address_input = QLineEdit("127.0.0.1")
+        self.osc_address_input.setPlaceholderText("127.0.0.1")
+        osc_layout.addRow("Address:", self.osc_address_input)
+
+        # OSC port
+        self.osc_port_input = QSpinBox()
+        self.osc_port_input.setRange(1, 65535)
+        self.osc_port_input.setValue(9988)
+        osc_layout.addRow("Port:", self.osc_port_input)
+
+        osc_group.setLayout(osc_layout)
+        layout.addWidget(osc_group)
 
         # === Start/Stop Button ===
         self.control_button = QPushButton("Start Decoding")
@@ -117,7 +141,12 @@ class LiveDecoderTab(QWidget):
         # Main timecode display - large font
         self.timecode_label = QLabel("--:--:--:--")
         self.timecode_label.setAlignment(Qt.AlignCenter)
-        self.timecode_label.setFont(QFont("Monospace", 48, QFont.Bold))
+        # Use Qt's style hint for monospace font (cross-platform compatible)
+        font = QFont()
+        font.setStyleHint(QFont.Monospace)
+        font.setPointSize(48)
+        font.setBold(True)
+        self.timecode_label.setFont(font)
         self.timecode_label.setStyleSheet("""
             QLabel {
                 background-color: #000;
@@ -177,9 +206,11 @@ class LiveDecoderTab(QWidget):
         """Get the selected audio channel (0 or 1)."""
         return self.channel_combo.currentIndex()
 
-    def _get_sample_rate(self) -> int:
-        """Get sample rate from combo box."""
+    def _get_sample_rate(self) -> Optional[int]:
+        """Get sample rate from combo box. Returns None for auto-detect."""
         text = self.sample_rate_combo.currentText()
+        if "Auto" in text:
+            return None
         if "44100" in text:
             return 44100
         return 48000
@@ -197,6 +228,11 @@ class LiveDecoderTab(QWidget):
         channel = self._get_selected_channel()
         sample_rate = self._get_sample_rate()
 
+        # OSC settings
+        osc_enabled = self.osc_enabled_checkbox.isChecked()
+        osc_address = self.osc_address_input.text()
+        osc_port = self.osc_port_input.value()
+
         # Create and start decoder
         try:
             self.decoder = Decoder(
@@ -205,6 +241,9 @@ class LiveDecoderTab(QWidget):
                 device=device,
                 channel=channel,
                 debug=False,
+                osc_enabled=osc_enabled,
+                osc_address=osc_address,
+                osc_port=osc_port,
             )
             self.decoder.start()
 
@@ -230,6 +269,9 @@ class LiveDecoderTab(QWidget):
             self.device_combo.setEnabled(False)
             self.channel_combo.setEnabled(False)
             self.sample_rate_combo.setEnabled(False)
+            self.osc_enabled_checkbox.setEnabled(False)
+            self.osc_address_input.setEnabled(False)
+            self.osc_port_input.setEnabled(False)
 
             # Start the update timer
             self.update_timer.start()
@@ -267,6 +309,9 @@ class LiveDecoderTab(QWidget):
         self.device_combo.setEnabled(True)
         self.channel_combo.setEnabled(True)
         self.sample_rate_combo.setEnabled(True)
+        self.osc_enabled_checkbox.setEnabled(True)
+        self.osc_address_input.setEnabled(True)
+        self.osc_port_input.setEnabled(True)
 
         # Stop the update timer
         self.update_timer.stop()
@@ -280,7 +325,8 @@ class LiveDecoderTab(QWidget):
         if not self.decoder or not self.is_running:
             return
 
-        tc = self.decoder.get_timecode()
+        # Get timecode and send OSC if enabled
+        tc = self.decoder.get_timecode(send_osc=True)
         stats = self.decoder.get_statistics()
 
         if tc:
@@ -291,9 +337,12 @@ class LiveDecoderTab(QWidget):
 
             # Update status
             direction = "▲" if tc.count_up else "▼"
-            fps = tc.fps if tc.fps else "Unknown"
+            # Use decoder's detected frame rate, not tc.fps (which may be wrong for 23.98/24 fps)
+            fps = self.decoder.frame_rate if self.decoder.frame_rate else (tc.fps if tc.fps else "Unknown")
+            sr = self.decoder.sample_rate
+            osc_indicator = "OSC " if self.decoder.osc_broadcaster else ""
             self.status_label.setText(
-                f"Status: Locked | {direction} {fps} fps | Frames: {stats['packets_received']}"
+                f"Status: Locked | {direction} {fps} fps | {sr} Hz | {osc_indicator}Frames: {stats['packets_received']}"
             )
 
             # Set green color when locked
