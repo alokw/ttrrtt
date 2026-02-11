@@ -212,7 +212,8 @@ class BiphaseMDecoder:
         bits = []
         half_period = int(round(self.samples_per_bit / 2))
         full_period = int(round(self.samples_per_bit))
-        tolerance = 2
+        # Increased tolerance for Windows audio jitter (was 2)
+        tolerance = 4
 
         # Walk through edges, grouping them into bit cells
         edge_idx = 0

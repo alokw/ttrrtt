@@ -792,12 +792,15 @@ class Decoder:
             return  # Already running
 
         # Request all available channels so user can select which one to use
+        # Use fixed blocksize for consistent timing (especially important on Windows)
+        # 0 = let system decide, but this causes jitter on Windows audio drivers
         self.stream = sd.InputStream(
             device=self.device,
             channels=2,  # Request stereo to get both channels
             samplerate=self.sample_rate,
             callback=self._audio_callback,
-            blocksize=0,
+            blocksize=2048,  # Fixed buffer size for consistent timing
+            latency='low',   # Request low latency mode
         )
 
         self.stream.start()
